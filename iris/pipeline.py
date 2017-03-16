@@ -12,6 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+################################################################################
+# This sample has been deprecated.
+################################################################################
+
+
 """Iris Classification Sample Cloud Runner.
 """
 import argparse
@@ -171,7 +177,7 @@ def preprocess(pipeline, training_data, eval_data, predict_data, output_dir):
 
 def get_train_parameters(trainer_uri, endpoint, metadata, trainer_job_args):
   return {
-      'package_uris': [trainer_uri],
+      'package_uris': [trainer_uri, ml.version.installed_sdk_location],
       'python_module': MODULE_NAME,
       'export_subdir': EXPORT_SUBDIRECTORY,
       'cloud_ml_endpoint': endpoint,

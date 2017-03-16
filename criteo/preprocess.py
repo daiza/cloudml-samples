@@ -25,6 +25,11 @@ import google.cloud.ml as ml
 import google.cloud.ml.io as io
 
 
+################################################################################
+# This sample has been deprecated.
+################################################################################
+
+
 def _default_project():
   get_project = ['gcloud', 'config', 'list', 'project',
                  '--format=value(core.project)']

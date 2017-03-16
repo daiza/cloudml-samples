@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sample for Criteo dataset can be run as a wide or deep model."""
+"""Sample for Criteo dataset can be run as a wide, deep, or tree model."""
 
 import argparse
 import json
@@ -23,14 +23,18 @@ from . import util
 
 import tensorflow as tf
 from tensorflow.contrib.learn.python.learn import learn_runner
+from tensorflow.contrib.learn.python.learn import metric_spec
 from tensorflow.contrib.session_bundle import manifest_pb2
+from tensorflow.contrib.tensor_forest.client import eval_metrics
+from tensorflow.contrib.tensor_forest.client import random_forest
+from tensorflow.contrib.tensor_forest.python import tensor_forest
 
 import google.cloud.ml as ml
 
 DATASETS = ['kaggle', 'large']
 KAGGLE, LARGE = DATASETS
-MODEL_TYPES = ['linear', 'deep']
-LINEAR, DEEP = MODEL_TYPES
+MODEL_TYPES = ['linear', 'deep', 'random_forest']
+LINEAR, DEEP, RANDOM_FOREST = MODEL_TYPES
 
 CROSSES = 'crosses'
 NUM_EXAMPLES = 'num_examples'
@@ -38,6 +42,8 @@ L2_REGULARIZATION = 'l2_regularization'
 
 EXAMPLES_PLACEHOLDER_KEY = 'input_feature'
 
+CRITEO_NUM_INT_FEATURES = 14
+CRITEO_NUM_FEATURES = 40
 KEY_FEATURE_COLUMN = 'example_id'
 TARGET_FEATURE_COLUMN = 'clicked'
 
@@ -138,24 +144,35 @@ def create_parser():
       action='store_true',
       default=False,
       help='Whether to ignore crosses (linear model only).')
+  parser.add_argument(
+      '--num_trees',
+      help='Number of trees in RandomForest estimator.',
+      default=100,
+      type=int)
+  parser.add_argument(
+      '--max_nodes',
+      help='Maximum number of nodes in RandomForest estimator.',
+      default=10000,
+      type=int)
   return parser
 
 
 def feature_columns(config, model_type, vocab_sizes, use_crosses):
   """Return the feature columns with their names and types."""
   columns = []
-  boundaries = [1.5**j - 0.51 for j in range(40)]
-  for index in range(1, 14):
-    column = tf.contrib.layers.bucketized_column(
-        tf.contrib.layers.real_valued_column(
-            'int-feature-{}'.format(index),
-            default_value=-1,
-            dtype=tf.int64),
-        boundaries)
-    columns.append(column)
+  # Continuous features should be bucketized for linear and deep neural network
+  # models.
+  if model_type == LINEAR or model_type == DEEP:
+    boundaries = [1.5**j - 0.51 for j in range(CRITEO_NUM_FEATURES)]
+    for index in range(1, CRITEO_NUM_INT_FEATURES):
+      column_name = 'int-feature-{}'.format(index)
+      column = tf.contrib.layers.bucketized_column(
+          tf.contrib.layers.real_valued_column(
+              column_name, default_value=-1, dtype=tf.int64), boundaries)
+      columns.append(column)
 
   if model_type == LINEAR:
-    for index in range(14, 40):
+    for index in range(CRITEO_NUM_INT_FEATURES, CRITEO_NUM_FEATURES):
       column_name = 'categorical-feature-{}'.format(index)
       vocab_size = vocab_sizes[column_name]
       column = tf.contrib.layers.sparse_column_with_integerized_feature(
@@ -170,7 +187,7 @@ def feature_columns(config, model_type, vocab_sizes, use_crosses):
             combiner='sum')
         columns.append(column)
   elif model_type == DEEP:
-    for index in range(14, 40):
+    for index in range(CRITEO_NUM_INT_FEATURES, CRITEO_NUM_FEATURES):
       column_name = 'categorical-feature-{}'.format(index)
       vocab_size = vocab_sizes[column_name]
       column = tf.contrib.layers.sparse_column_with_integerized_feature(
@@ -180,7 +197,22 @@ def feature_columns(config, model_type, vocab_sizes, use_crosses):
                                                      embedding_size,
                                                      combiner='mean')
       columns.append(embedding)
+  elif model_type == RANDOM_FOREST:
+    # For RandomForest, continuous features can be used directly without
+    # bucketization.
+    for index in range(1, CRITEO_NUM_INT_FEATURES):
+      column_name = 'int-feature-{}'.format(index)
+      column = tf.contrib.layers.real_valued_column(
+          column_name, default_value=-1, dtype=tf.int64)
+      columns.append(column)
 
+    # For categorical features, we use sparse integerized feature column.
+    for index in range(CRITEO_NUM_INT_FEATURES, CRITEO_NUM_FEATURES):
+      column_name = 'categorical-feature-{}'.format(index)
+      vocab_size = vocab_sizes[column_name]
+      column = tf.contrib.layers.sparse_column_with_integerized_feature(
+          column_name, bucket_size=vocab_size, combiner='sum')
+      columns.append(column)
   return columns
 
 
@@ -194,7 +226,7 @@ def get_placeholder_input_fn(config, model_type, vocab_sizes, use_crosses):
 
     # Add a dense feature for the keys, use '' if not on the tf.Example proto.
     feature_spec[KEY_FEATURE_COLUMN] = tf.FixedLenFeature(
-        [], dtype=tf.string, default_value='')
+        [1], dtype=tf.string, default_value='')
 
     # Add a placeholder for the serialized tf.Example proto input.
     examples = tf.placeholder(tf.string, shape=(None,))
@@ -234,7 +266,14 @@ def get_reader_input_fn(data_paths, config, model_type, vocab_sizes, batch_size,
         randomize_input=(mode != tf.contrib.learn.ModeKeys.EVAL),
         num_epochs=(1 if mode == tf.contrib.learn.ModeKeys.EVAL else None))
     target = features.pop(TARGET_FEATURE_COLUMN)
-    features[KEY_FEATURE_COLUMN] = keys
+
+    if model_type == LINEAR or model_type == DEEP:
+      features[KEY_FEATURE_COLUMN] = keys
+    elif model_type == RANDOM_FOREST:
+      # TODO(pew): Remove this once cr/148825114 which removes the shape
+      # check made its way to TF version runs on cloud.
+      features[KEY_FEATURE_COLUMN] = tf.expand_dims(keys, -1)
+
     return features, target
 
   # Return a function to input the features into the model from a data path.
@@ -245,6 +284,12 @@ def get_export_signature(examples, features, predictions):
   """Create a classification signature function and add output placeholders."""
   inputs = {'examples': examples.name}
   tf.add_to_collection('inputs', json.dumps(inputs))
+
+  # TensorForest currently outputs a dict of both probabilities and
+  # class predictions.
+  if isinstance(predictions, dict) and (
+      eval_metrics.INFERENCE_PROB_NAME in predictions):
+    predictions = predictions[eval_metrics.INFERENCE_PROB_NAME]
 
   prediction = tf.argmax(predictions, 1)
   labels = tf.contrib.lookup.index_to_string(
@@ -277,7 +322,7 @@ def get_vocab_sizes(metadata_path):
   """Read vocabulary sizes from the metadata."""
   metadata = read_metadata_file(metadata_path)
   sizes = {}
-  for index in range(14, 40):
+  for index in range(14, CRITEO_NUM_FEATURES):
     column = 'categorical-feature-{}'.format(index)
     sizes[column] = metadata['features'][column]['size']
   return sizes
@@ -287,6 +332,17 @@ def get_experiment_fn(args):
   """Wrap the get experiment function to provide the runtime arguments."""
 
   vocab_sizes = get_vocab_sizes(args.metadata_path)
+
+  def _int_to_float_map(int_features, labels):
+    """ Feature engineering function to map 'int' to 'float' so the features
+        get treated as continuous.
+    """
+    float_features = {}
+    float_features.update(int_features)
+    for k, v in int_features.iteritems():
+      if k.startswith('int'):
+        float_features[k] = tf.to_float(v)
+    return float_features, labels
 
   def get_experiment(output_dir):
     """Function that creates an experiment http://goo.gl/HcKHlT.
@@ -307,6 +363,7 @@ def get_experiment_fn(args):
     num_partitions = max(1, 1 + cluster.num_tasks('worker') if cluster and
                          'worker' in cluster.jobs else 0)
 
+    monitors = []
     if args.model_type == LINEAR:
       l2_regularization = args.l2_regularization or config[L2_REGULARIZATION]
       estimator = tf.contrib.learn.LinearClassifier(
@@ -322,6 +379,20 @@ def get_experiment_fn(args):
           hidden_units=args.hidden_units,
           feature_columns=columns,
           model_dir=output_dir)
+    elif args.model_type == RANDOM_FOREST:
+      params = tensor_forest.ForestHParams(
+          num_classes=2,
+          num_features=CRITEO_NUM_FEATURES,
+          num_trees=args.num_trees,
+          max_nodes=args.max_nodes)
+      # TODO(pew): Returns TensorForestEstimator object directly after a new
+      # release of TensorFlow becomes available.
+      estimator = random_forest.TensorForestEstimator(
+          params.fill(),
+          feature_engineering_fn=_int_to_float_map,
+          early_stopping_rounds=2000,
+          model_dir=output_dir)._estimator
+      monitors.append(random_forest.TensorForestLossHook(100))
 
     l2_regularization = args.l2_regularization or config[L2_REGULARIZATION]
 
@@ -336,31 +407,50 @@ def get_experiment_fn(args):
         input_fn=input_placeholder_for_prediction,
         input_feature_key=EXAMPLES_PLACEHOLDER_KEY,
         signature_fn=get_export_signature)
+    monitors.append(export_monitor)
 
-    train_input_fn = get_reader_input_fn(args.train_data_paths, config,
-                                         args.model_type, vocab_sizes,
-                                         args.batch_size,
-                                         not args.ignore_crosses,
-                                         tf.contrib.learn.ModeKeys.TRAIN)
+    train_input_fn = get_reader_input_fn(
+        args.train_data_paths, config, args.model_type, vocab_sizes,
+        args.batch_size, not args.ignore_crosses,
+        tf.contrib.learn.ModeKeys.TRAIN)
 
-    eval_input_fn = get_reader_input_fn(args.eval_data_paths, config,
-                                        args.model_type, vocab_sizes,
-                                        args.eval_batch_size,
-                                        not args.ignore_crosses,
-                                        tf.contrib.learn.ModeKeys.EVAL)
+    eval_input_fn = get_reader_input_fn(
+        args.eval_data_paths, config, args.model_type, vocab_sizes,
+        args.eval_batch_size, not args.ignore_crosses,
+        tf.contrib.learn.ModeKeys.EVAL)
 
     train_set_size = args.train_set_size or config[NUM_EXAMPLES]
 
+    def _get_eval_metrics(model_type):
+      """Returns a dict of 'string' to 'MetricSpec' objects."""
+      classes_prediction_key = "classes"
+      if model_type == RANDOM_FOREST:
+        classes_prediction_key = "predictions"
+      eval_metrics = {}
+      eval_metrics["accuracy"] = metric_spec.MetricSpec(
+          prediction_key=classes_prediction_key,
+          metric_fn=tf.contrib.metrics.streaming_accuracy)
+      eval_metrics["precision"] = metric_spec.MetricSpec(
+          prediction_key=classes_prediction_key,
+          metric_fn=tf.contrib.metrics.streaming_precision)
+      eval_metrics["recall"] = metric_spec.MetricSpec(
+          prediction_key=classes_prediction_key,
+          metric_fn=tf.contrib.metrics.streaming_recall)
+      return eval_metrics
+
     # TODO(zoy): Switch to using ExportStrategy when available.
-    return tf.contrib.learn.Experiment(
+    experiment = tf.contrib.learn.Experiment(
         estimator=estimator,
         train_steps=(args.train_steps or
                      args.num_epochs * train_set_size // args.batch_size),
         eval_steps=args.eval_steps,
         train_input_fn=train_input_fn,
         eval_input_fn=eval_input_fn,
-        train_monitors=[export_monitor],
-        min_eval_frequency=500)
+        eval_metrics=_get_eval_metrics(args.model_type),
+        train_monitors=monitors,
+        min_eval_frequency=100)
+
+    return experiment
 
   # Return a function to create an Experiment.
   return get_experiment
@@ -374,13 +464,11 @@ def main(argv=None):
   task_data = env.get('task') or {'type': 'master', 'index': 0}
   argv = sys.argv if argv is None else argv
   args = create_parser().parse_args(args=argv[1:])
-
   trial = task_data.get('trial')
   if trial is not None:
     output_dir = os.path.join(args.output_path, trial)
   else:
     output_dir = args.output_path
-
   learn_runner.run(experiment_fn=get_experiment_fn(args),
                    output_dir=output_dir)
 
